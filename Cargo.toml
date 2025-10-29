@@ -1,0 +1,13 @@
+[package]
+name = "localpacketDump"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ctrlc = "3.4.7"
+local-ip-address = "0.6.5"
+pcap = "2.3.0"
+pnet = "0.35.0"
+prometheus = "0.13"
+tokio = { version = "1.0", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
