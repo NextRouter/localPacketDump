@@ -10,8 +10,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-REPO_URL="https://github.com/NextRouter/localPacletDump.git"
-INSTALL_DIR="$HOME/localPacletDump"
+REPO_URL="https://github.com/NextRouter/localPacketDump.git"
+INSTALL_DIR="$HOME/localPacketDump"
 
 echo -e "${BLUE}🚀 Local Packet Dump ワンライナーインストーラー${NC}"
 echo "=============================================="

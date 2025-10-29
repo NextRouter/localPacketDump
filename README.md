@@ -1,21 +1,21 @@
 # Local Packet Dump
 
-ネットワークパケットをキャプチャして、IPアドレス別の通信統計をリアルタイムで監視するツールです。Prometheusメトリクスとして出力し、Webインターフェースで確認できます。
+ネットワークパケットをキャプチャして、IP アドレス別の通信統計をリアルタイムで監視するツールです。Prometheus メトリクスとして出力し、Web インターフェースで確認できます。
 
 ## 🚀 クイックスタート
 
 ### ワンコマンドで実行
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/NextRouter/localPacletDump/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/NextRouter/localPacketDump/main/install.sh | bash
 ```
 
 ### 手動インストール
 
 ```bash
 # リポジトリをクローン
-git clone https://github.com/NextRouter/localPacletDump.git
-cd localPacletDump
+git clone https://github.com/NextRouter/localPacketDump.git
+cd localPacketDump
 
 # 一回だけ実行
 ./run.sh
@@ -28,26 +28,26 @@ cd localPacletDump
 
 - Linux OS
 - Rust 1.70+
-- sudo権限（パケットキャプチャのため）
-- libpcap開発ライブラリ
+- sudo 権限（パケットキャプチャのため）
+- libpcap 開発ライブラリ
 
 ## 🔧 機能
 
 - **リアルタイムパケット監視**: ネットワークインターフェースからパケットをキャプチャ
-- **IP別統計**: 送受信バイト数、bps、再送信数などをIP別に集計
-- **Prometheusメトリクス**: `http://localhost:9090/metrics` でメトリクス取得
+- **IP 別統計**: 送受信バイト数、bps、再送信数などを IP 別に集計
+- **Prometheus メトリクス**: `http://localhost:9090/metrics` でメトリクス取得
 - **自動ネットワークインターフェース検出**: アクティブなインターフェースを自動選択
 
 ## 📊 提供メトリクス
 
-- `network_ip_tx_bytes_total`: IP別送信バイト総数
-- `network_ip_rx_bytes_total`: IP別受信バイト総数  
-- `network_ip_tx_bytes_per_sec`: IP別送信バイト/秒
-- `network_ip_rx_bytes_per_sec`: IP別受信バイト/秒
-- `network_ip_tx_bps`: IP別送信ビット/秒
-- `network_ip_rx_bps`: IP別受信ビット/秒
-- `network_ip_retransmissions_per_sec`: IP別再送信/秒
-- `network_ip_duplicate_acks_per_sec`: IP別重複ACK/秒
+- `network_ip_tx_bytes_total`: IP 別送信バイト総数
+- `network_ip_rx_bytes_total`: IP 別受信バイト総数
+- `network_ip_tx_bytes_per_sec`: IP 別送信バイト/秒
+- `network_ip_rx_bytes_per_sec`: IP 別受信バイト/秒
+- `network_ip_tx_bps`: IP 別送信ビット/秒
+- `network_ip_rx_bps`: IP 別受信ビット/秒
+- `network_ip_retransmissions_per_sec`: IP 別再送信/秒
+- `network_ip_duplicate_acks_per_sec`: IP 別重複 ACK/秒
 
 ## 🛠️ 手動ビルド
 
@@ -73,7 +73,7 @@ sudo ./target/release/localpacketDump
 curl http://localhost:9090/metrics
 ```
 
-## 🔧 systemdサービスとして登録
+## 🔧 systemd サービスとして登録
 
 ### 1. サービスファイル作成
 
@@ -146,7 +146,7 @@ sudo systemctl daemon-reload
 
 ### 4. 自動セットアップスクリプト
 
-systemdサービスの自動登録：
+systemd サービスの自動登録：
 
 ```bash
 ./setup-systemd.sh
@@ -154,9 +154,9 @@ systemdサービスの自動登録：
 
 ## ⚠️ 注意事項
 
-- パケットキャプチャにはroot権限が必要です
-- ファイアウォールでポート9090が開いていることを確認してください
-- 大量トラフィック環境では CPU使用率が高くなる可能性があります
+- パケットキャプチャには root 権限が必要です
+- ファイアウォールでポート 9090 が開いていることを確認してください
+- 大量トラフィック環境では CPU 使用率が高くなる可能性があります
 
 ## 📝 ライセンス
 
