@@ -1,11 +1,14 @@
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Response, Server};
+use pcap::{Capture, Device};
 use pnet::datalink;
 use pnet::ipnetwork::IpNetwork;
-use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::{TcpPacket, TcpFlags};
-use pcap::{Capture, Device};
+use pnet::packet::tcp::{TcpFlags, TcpPacket};
+use pnet::packet::Packet;
+use prometheus::{Counter, Encoder, Gauge, Registry, TextEncoder};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -14,9 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use prometheus::{Counter, Gauge, Registry, TextEncoder, Encoder};
-use hyper::{Body, Response, Server};
-use hyper::service::{make_service_fn, service_fn};
 use tokio::runtime::Runtime;
 
 static SIGINT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -47,95 +47,180 @@ struct PrometheusMetrics {
 impl PrometheusMetrics {
     fn new() -> Self {
         let registry = Registry::new();
-        
+
         // 全体のメトリクス - パケットロスは累積値として扱う
-        let tx_bytes_total = Counter::new("network_tx_bytes_total", "Total transmitted bytes").unwrap();
-        let rx_bytes_total = Counter::new("network_rx_bytes_total", "Total received bytes").unwrap();
-        let tx_bytes_per_sec = Gauge::new("network_tx_bytes_per_sec", "Transmitted bytes per second").unwrap();
-        let rx_bytes_per_sec = Gauge::new("network_rx_bytes_per_sec", "Received bytes per second").unwrap();
+        let tx_bytes_total =
+            Counter::new("network_tx_bytes_total", "Total transmitted bytes").unwrap();
+        let rx_bytes_total =
+            Counter::new("network_rx_bytes_total", "Total received bytes").unwrap();
+        let tx_bytes_per_sec =
+            Gauge::new("network_tx_bytes_per_sec", "Transmitted bytes per second").unwrap();
+        let rx_bytes_per_sec =
+            Gauge::new("network_rx_bytes_per_sec", "Received bytes per second").unwrap();
         let tx_bps = Gauge::new("network_tx_bps", "Transmitted bits per second").unwrap();
         let rx_bps = Gauge::new("network_rx_bps", "Received bits per second").unwrap();
-        let retransmissions_per_sec = Gauge::new("network_retransmissions_per_sec", "Retransmissions per second").unwrap();
-        let duplicate_acks_per_sec = Gauge::new("network_duplicate_acks_per_sec", "Duplicate ACKs per second").unwrap();
-        let window_size_changes_per_sec = Gauge::new("network_window_size_changes_per_sec", "Window size changes per second").unwrap();
-        
+        let retransmissions_per_sec = Gauge::new(
+            "network_retransmissions_per_sec",
+            "Retransmissions per second",
+        )
+        .unwrap();
+        let duplicate_acks_per_sec = Gauge::new(
+            "network_duplicate_acks_per_sec",
+            "Duplicate ACKs per second",
+        )
+        .unwrap();
+        let window_size_changes_per_sec = Gauge::new(
+            "network_window_size_changes_per_sec",
+            "Window size changes per second",
+        )
+        .unwrap();
+
         // IPごとのメトリクス
         let ip_tx_bytes_total = prometheus::CounterVec::new(
-            prometheus::Opts::new("network_ip_tx_bytes_total", "Total transmitted bytes per IP"),
-            &["ip_address"]
-        ).unwrap();
+            prometheus::Opts::new(
+                "network_ip_tx_bytes_total",
+                "Total transmitted bytes per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_rx_bytes_total = prometheus::CounterVec::new(
             prometheus::Opts::new("network_ip_rx_bytes_total", "Total received bytes per IP"),
-            &["ip_address"]
-        ).unwrap();
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_tx_bytes_per_sec = prometheus::GaugeVec::new(
-            prometheus::Opts::new("network_ip_tx_bytes_per_sec", "Transmitted bytes per second per IP"),
-            &["ip_address"]
-        ).unwrap();
+            prometheus::Opts::new(
+                "network_ip_tx_bytes_per_sec",
+                "Transmitted bytes per second per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_rx_bytes_per_sec = prometheus::GaugeVec::new(
-            prometheus::Opts::new("network_ip_rx_bytes_per_sec", "Received bytes per second per IP"),
-            &["ip_address"]
-        ).unwrap();
+            prometheus::Opts::new(
+                "network_ip_rx_bytes_per_sec",
+                "Received bytes per second per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_tx_bps = prometheus::GaugeVec::new(
             prometheus::Opts::new("network_ip_tx_bps", "Transmitted bits per second per IP"),
-            &["ip_address"]
-        ).unwrap();
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_rx_bps = prometheus::GaugeVec::new(
             prometheus::Opts::new("network_ip_rx_bps", "Received bits per second per IP"),
-            &["ip_address"]
-        ).unwrap();
+            &["ip_address"],
+        )
+        .unwrap();
         // パケットロス関連は1秒間の値をGaugeで表示
         let ip_retransmissions_per_sec = prometheus::GaugeVec::new(
-            prometheus::Opts::new("network_ip_retransmissions_per_sec", "Retransmissions per second per IP"),
-            &["ip_address"]
-        ).unwrap();
+            prometheus::Opts::new(
+                "network_ip_retransmissions_per_sec",
+                "Retransmissions per second per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_duplicate_acks_per_sec = prometheus::GaugeVec::new(
-            prometheus::Opts::new("network_ip_duplicate_acks_per_sec", "Duplicate ACKs per second per IP"),
-            &["ip_address"]
-        ).unwrap();
+            prometheus::Opts::new(
+                "network_ip_duplicate_acks_per_sec",
+                "Duplicate ACKs per second per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_window_size_changes_per_sec = prometheus::GaugeVec::new(
-            prometheus::Opts::new("network_ip_window_size_changes_per_sec", "Window size changes per second per IP"),
-            &["ip_address"]
-        ).unwrap();
-        
+            prometheus::Opts::new(
+                "network_ip_window_size_changes_per_sec",
+                "Window size changes per second per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
+
         // 累積値のパケットロスメトリクスも追加
         let ip_retransmissions_total = prometheus::CounterVec::new(
-            prometheus::Opts::new("network_ip_retransmissions_total", "Total retransmissions per IP"),
-            &["ip_address"]
-        ).unwrap();
+            prometheus::Opts::new(
+                "network_ip_retransmissions_total",
+                "Total retransmissions per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_duplicate_acks_total = prometheus::CounterVec::new(
-            prometheus::Opts::new("network_ip_duplicate_acks_total", "Total duplicate ACKs per IP"),
-            &["ip_address"]
-        ).unwrap();
+            prometheus::Opts::new(
+                "network_ip_duplicate_acks_total",
+                "Total duplicate ACKs per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
         let ip_window_size_changes_total = prometheus::CounterVec::new(
-            prometheus::Opts::new("network_ip_window_size_changes_total", "Total window size changes per IP"),
-            &["ip_address"]
-        ).unwrap();
-        
+            prometheus::Opts::new(
+                "network_ip_window_size_changes_total",
+                "Total window size changes per IP",
+            ),
+            &["ip_address"],
+        )
+        .unwrap();
+
         // メトリクス登録
         registry.register(Box::new(tx_bytes_total.clone())).unwrap();
         registry.register(Box::new(rx_bytes_total.clone())).unwrap();
-        registry.register(Box::new(tx_bytes_per_sec.clone())).unwrap();
-        registry.register(Box::new(rx_bytes_per_sec.clone())).unwrap();
+        registry
+            .register(Box::new(tx_bytes_per_sec.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(rx_bytes_per_sec.clone()))
+            .unwrap();
         registry.register(Box::new(tx_bps.clone())).unwrap();
         registry.register(Box::new(rx_bps.clone())).unwrap();
-        registry.register(Box::new(retransmissions_per_sec.clone())).unwrap();
-        registry.register(Box::new(duplicate_acks_per_sec.clone())).unwrap();
-        registry.register(Box::new(window_size_changes_per_sec.clone())).unwrap();
-        
-        registry.register(Box::new(ip_tx_bytes_total.clone())).unwrap();
-        registry.register(Box::new(ip_rx_bytes_total.clone())).unwrap();
-        registry.register(Box::new(ip_tx_bytes_per_sec.clone())).unwrap();
-        registry.register(Box::new(ip_rx_bytes_per_sec.clone())).unwrap();
+        registry
+            .register(Box::new(retransmissions_per_sec.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(duplicate_acks_per_sec.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(window_size_changes_per_sec.clone()))
+            .unwrap();
+
+        registry
+            .register(Box::new(ip_tx_bytes_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_rx_bytes_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_tx_bytes_per_sec.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_rx_bytes_per_sec.clone()))
+            .unwrap();
         registry.register(Box::new(ip_tx_bps.clone())).unwrap();
         registry.register(Box::new(ip_rx_bps.clone())).unwrap();
-        registry.register(Box::new(ip_retransmissions_per_sec.clone())).unwrap();
-        registry.register(Box::new(ip_duplicate_acks_per_sec.clone())).unwrap();
-        registry.register(Box::new(ip_window_size_changes_per_sec.clone())).unwrap();
-        registry.register(Box::new(ip_retransmissions_total.clone())).unwrap();
-        registry.register(Box::new(ip_duplicate_acks_total.clone())).unwrap();
-        registry.register(Box::new(ip_window_size_changes_total.clone())).unwrap();
-        
+        registry
+            .register(Box::new(ip_retransmissions_per_sec.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_duplicate_acks_per_sec.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_window_size_changes_per_sec.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_retransmissions_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_duplicate_acks_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ip_window_size_changes_total.clone()))
+            .unwrap();
+
         Self {
             registry,
             tx_bytes_total,
@@ -158,7 +243,7 @@ impl PrometheusMetrics {
             ip_window_size_changes_per_sec,
         }
     }
-    
+
     fn update_metrics(&self, stats: &HashMap<IpAddr, IpStats>, target_ips: &HashSet<IpAddr>) {
         let mut total_tx_bytes = 0u64;
         let mut total_rx_bytes = 0u64;
@@ -169,36 +254,50 @@ impl PrometheusMetrics {
         let mut total_retransmissions_per_sec = 0u64;
         let mut total_duplicate_acks_per_sec = 0u64;
         let mut total_window_size_changes_per_sec = 0u64;
-        
+
         for (ip, stat) in stats {
             let ip_str = ip.to_string();
-            
+
             // 累積値は一度だけ設定（reset使わない）
             let tx_counter = self.ip_tx_bytes_total.with_label_values(&[&ip_str]);
             let rx_counter = self.ip_rx_bytes_total.with_label_values(&[&ip_str]);
-            
+
             // 現在の値を取得して差分を計算
             let current_tx = tx_counter.get();
             let current_rx = rx_counter.get();
-            
+
             if stat.tx_byte_count as f64 > current_tx {
                 tx_counter.inc_by(stat.tx_byte_count as f64 - current_tx);
             }
             if stat.rx_byte_count as f64 > current_rx {
                 rx_counter.inc_by(stat.rx_byte_count as f64 - current_rx);
             }
-            
+
             // 1秒間の値はGaugeで設定
-            self.ip_tx_bytes_per_sec.with_label_values(&[&ip_str]).set(stat.tx_bytes_per_sec as f64);
-            self.ip_rx_bytes_per_sec.with_label_values(&[&ip_str]).set(stat.rx_bytes_per_sec as f64);
-            self.ip_tx_bps.with_label_values(&[&ip_str]).set(stat.tx_current_bps);
-            self.ip_rx_bps.with_label_values(&[&ip_str]).set(stat.rx_current_bps);
-            
+            self.ip_tx_bytes_per_sec
+                .with_label_values(&[&ip_str])
+                .set(stat.tx_bytes_per_sec as f64);
+            self.ip_rx_bytes_per_sec
+                .with_label_values(&[&ip_str])
+                .set(stat.rx_bytes_per_sec as f64);
+            self.ip_tx_bps
+                .with_label_values(&[&ip_str])
+                .set(stat.tx_current_bps);
+            self.ip_rx_bps
+                .with_label_values(&[&ip_str])
+                .set(stat.rx_current_bps);
+
             // パケットロス関連も同じように処理
-            self.ip_retransmissions_per_sec.with_label_values(&[&ip_str]).set(stat.retransmissions_per_sec as f64);
-            self.ip_duplicate_acks_per_sec.with_label_values(&[&ip_str]).set(stat.duplicate_acks_per_sec as f64);
-            self.ip_window_size_changes_per_sec.with_label_values(&[&ip_str]).set(stat.window_size_changes_per_sec as f64);
-            
+            self.ip_retransmissions_per_sec
+                .with_label_values(&[&ip_str])
+                .set(stat.retransmissions_per_sec as f64);
+            self.ip_duplicate_acks_per_sec
+                .with_label_values(&[&ip_str])
+                .set(stat.duplicate_acks_per_sec as f64);
+            self.ip_window_size_changes_per_sec
+                .with_label_values(&[&ip_str])
+                .set(stat.window_size_changes_per_sec as f64);
+
             // target_ipsに含まれる場合のみ全体統計に含める
             if target_ips.contains(ip) {
                 total_tx_bytes += stat.tx_byte_count;
@@ -212,33 +311,38 @@ impl PrometheusMetrics {
                 total_window_size_changes_per_sec += stat.window_size_changes_per_sec;
             }
         }
-        
+
         // 全体のメトリクスを更新（累積値は適切に処理）
         let current_total_tx = self.tx_bytes_total.get();
         let current_total_rx = self.rx_bytes_total.get();
-        
+
         if total_tx_bytes as f64 > current_total_tx {
-            self.tx_bytes_total.inc_by(total_tx_bytes as f64 - current_total_tx);
+            self.tx_bytes_total
+                .inc_by(total_tx_bytes as f64 - current_total_tx);
         }
         if total_rx_bytes as f64 > current_total_rx {
-            self.rx_bytes_total.inc_by(total_rx_bytes as f64 - current_total_rx);
+            self.rx_bytes_total
+                .inc_by(total_rx_bytes as f64 - current_total_rx);
         }
-        
+
         self.tx_bytes_per_sec.set(total_tx_bytes_per_sec as f64);
         self.rx_bytes_per_sec.set(total_rx_bytes_per_sec as f64);
         self.tx_bps.set(total_tx_bps);
         self.rx_bps.set(total_rx_bps);
-        self.retransmissions_per_sec.set(total_retransmissions_per_sec as f64);
-        self.duplicate_acks_per_sec.set(total_duplicate_acks_per_sec as f64);
-        self.window_size_changes_per_sec.set(total_window_size_changes_per_sec as f64);
+        self.retransmissions_per_sec
+            .set(total_retransmissions_per_sec as f64);
+        self.duplicate_acks_per_sec
+            .set(total_duplicate_acks_per_sec as f64);
+        self.window_size_changes_per_sec
+            .set(total_window_size_changes_per_sec as f64);
     }
 }
 
 struct IpStats {
-    tx_packet_count: u64,  // 送信パケット数
-    rx_packet_count: u64,  // 受信パケット数
-    tx_byte_count: u64,    // 送信バイト数
-    rx_byte_count: u64,    // 受信バイト数
+    tx_packet_count: u64, // 送信パケット数
+    rx_packet_count: u64, // 受信パケット数
+    tx_byte_count: u64,   // 送信バイト数
+    rx_byte_count: u64,   // 受信バイト数
     tx_last_bytes: u64,
     rx_last_bytes: u64,
     last_time: Instant,
@@ -246,16 +350,16 @@ struct IpStats {
     rx_current_bps: f64,   // 受信ビット/秒
     tx_bytes_per_sec: u64, // 1秒間の送信バイト数
     rx_bytes_per_sec: u64, // 1秒間の受信バイト数
-    
+
     // パケットロス関連
     expected_seq: HashMap<u16, u32>, // ポート別の期待シーケンス番号
-    retransmissions: u64,           // 再送パケット数
-    duplicate_acks: u64,            // 重複ACK数
-    last_retransmissions: u64,      // 前回の再送パケット数
-    last_duplicate_acks: u64,       // 前回の重複ACK数
-    retransmissions_per_sec: u64,   // 1秒間の再送パケット数
-    duplicate_acks_per_sec: u64,    // 1秒間の重複ACK数
-    
+    retransmissions: u64,            // 再送パケット数
+    duplicate_acks: u64,             // 重複ACK数
+    last_retransmissions: u64,       // 前回の再送パケット数
+    last_duplicate_acks: u64,        // 前回の重複ACK数
+    retransmissions_per_sec: u64,    // 1秒間の再送パケット数
+    duplicate_acks_per_sec: u64,     // 1秒間の重複ACK数
+
     // TCPウィンドウサイズ関連
     last_window_size: HashMap<u16, u16>, // ポート別の最後のウィンドウサイズ
     window_size_changes: u64,            // ウィンドウサイズ変更回数
@@ -310,8 +414,11 @@ fn main() {
             println!("Subnet Mask: /{}", prefix);
 
             let ip_set = ipv4_list(ip, prefix);
-            println!("Available IP addresses in subnet: {} addresses", ip_set.len());
-            
+            println!(
+                "Available IP addresses in subnet: {} addresses",
+                ip_set.len()
+            );
+
             // 最初の10個のIPアドレスを表示
             let mut count = 0;
             for ip_addr in &ip_set {
@@ -323,17 +430,17 @@ fn main() {
                     break;
                 }
             }
-            
+
             // Prometheusメトリクスを初期化
             let prometheus_metrics = Arc::new(PrometheusMetrics::new());
-            
+
             // Prometheus HTTPサーバーを起動
             let metrics_clone = prometheus_metrics.clone();
             let rt = Runtime::new().unwrap();
             rt.spawn(async move {
                 start_prometheus_server(metrics_clone).await;
             });
-            
+
             // パケットキャプチャ部分に進む
             start_packet_capture(interface_name, ip_set, prometheus_metrics);
         }
@@ -347,7 +454,11 @@ fn main() {
     }
 }
 
-fn start_packet_capture(interface_name: &str, target_ips: HashSet<IpAddr>, prometheus_metrics: Arc<PrometheusMetrics>) {
+fn start_packet_capture(
+    interface_name: &str,
+    target_ips: HashSet<IpAddr>,
+    prometheus_metrics: Arc<PrometheusMetrics>,
+) {
     // インターフェースを見つける
     let device = Device::list()
         .unwrap()
@@ -427,28 +538,48 @@ fn start_packet_capture(interface_name: &str, target_ips: HashSet<IpAddr>, prome
                                 // ソースまたはデスティネーションがターゲットIPセットに含まれている場合のみ処理
                                 if target_ips.contains(&src_ip) || target_ips.contains(&dst_ip) {
                                     let mut stats = ip_stats.lock().unwrap();
-                                    
+
                                     // TCPパケットの場合、追加情報を解析
-                                    if ipv4.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Tcp {
+                                    if ipv4.get_next_level_protocol()
+                                        == pnet::packet::ip::IpNextHeaderProtocols::Tcp
+                                    {
                                         if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
                                             // 送信トラフィック（ソースIPがターゲットセット内）
                                             if target_ips.contains(&src_ip) {
-                                                update_tx_stats_with_tcp(&mut stats, src_ip, packet.header.len as u64, &tcp);
+                                                update_tx_stats_with_tcp(
+                                                    &mut stats,
+                                                    src_ip,
+                                                    packet.header.len as u64,
+                                                    &tcp,
+                                                );
                                             }
-                                            
+
                                             // 受信トラフィック（デスティネーションIPがターゲットセット内）
                                             if target_ips.contains(&dst_ip) {
-                                                update_rx_stats_with_tcp(&mut stats, dst_ip, packet.header.len as u64, &tcp);
+                                                update_rx_stats_with_tcp(
+                                                    &mut stats,
+                                                    dst_ip,
+                                                    packet.header.len as u64,
+                                                    &tcp,
+                                                );
                                             }
                                         }
                                     } else {
                                         // 非TCPパケット
                                         if target_ips.contains(&src_ip) {
-                                            update_tx_stats(&mut stats, src_ip, packet.header.len as u64);
+                                            update_tx_stats(
+                                                &mut stats,
+                                                src_ip,
+                                                packet.header.len as u64,
+                                            );
                                         }
-                                        
+
                                         if target_ips.contains(&dst_ip) {
-                                            update_rx_stats(&mut stats, dst_ip, packet.header.len as u64);
+                                            update_rx_stats(
+                                                &mut stats,
+                                                dst_ip,
+                                                packet.header.len as u64,
+                                            );
                                         }
                                     }
                                 }
@@ -565,7 +696,12 @@ fn update_rx_stats(stats: &mut HashMap<IpAddr, IpStats>, ip: IpAddr, bytes: u64)
     entry.rx_byte_count += bytes;
 }
 
-fn update_tx_stats_with_tcp(stats: &mut HashMap<IpAddr, IpStats>, ip: IpAddr, bytes: u64, tcp: &TcpPacket) {
+fn update_tx_stats_with_tcp(
+    stats: &mut HashMap<IpAddr, IpStats>,
+    ip: IpAddr,
+    bytes: u64,
+    tcp: &TcpPacket,
+) {
     let now = Instant::now();
     let entry = stats.entry(ip).or_insert(IpStats {
         tx_packet_count: 0,
@@ -594,12 +730,12 @@ fn update_tx_stats_with_tcp(stats: &mut HashMap<IpAddr, IpStats>, ip: IpAddr, by
 
     entry.tx_packet_count += 1;
     entry.tx_byte_count += bytes;
-    
+
     let src_port = tcp.get_source();
     let seq_num = tcp.get_sequence();
     let _ack_num = tcp.get_acknowledgement();
     let window_size = tcp.get_window();
-    
+
     // パケットロス検出（簡易版）
     if let Some(&expected) = entry.expected_seq.get(&src_port) {
         if seq_num < expected {
@@ -607,13 +743,18 @@ fn update_tx_stats_with_tcp(stats: &mut HashMap<IpAddr, IpStats>, ip: IpAddr, by
             entry.retransmissions += 1;
         }
     }
-    
+
     // 期待シーケンス番号の更新
     let payload_len = tcp.payload().len() as u32;
-    if payload_len > 0 || (tcp.get_flags() & TcpFlags::SYN) != 0 || (tcp.get_flags() & TcpFlags::FIN) != 0 {
-        entry.expected_seq.insert(src_port, seq_num + payload_len + 1);
+    if payload_len > 0
+        || (tcp.get_flags() & TcpFlags::SYN) != 0
+        || (tcp.get_flags() & TcpFlags::FIN) != 0
+    {
+        entry
+            .expected_seq
+            .insert(src_port, seq_num + payload_len + 1);
     }
-    
+
     // ウィンドウサイズ変更の検出
     if let Some(&last_window) = entry.last_window_size.get(&src_port) {
         if window_size != last_window {
@@ -623,7 +764,12 @@ fn update_tx_stats_with_tcp(stats: &mut HashMap<IpAddr, IpStats>, ip: IpAddr, by
     entry.last_window_size.insert(src_port, window_size);
 }
 
-fn update_rx_stats_with_tcp(stats: &mut HashMap<IpAddr, IpStats>, ip: IpAddr, bytes: u64, tcp: &TcpPacket) {
+fn update_rx_stats_with_tcp(
+    stats: &mut HashMap<IpAddr, IpStats>,
+    ip: IpAddr,
+    bytes: u64,
+    tcp: &TcpPacket,
+) {
     let now = Instant::now();
     let entry = stats.entry(ip).or_insert(IpStats {
         tx_packet_count: 0,
@@ -652,17 +798,17 @@ fn update_rx_stats_with_tcp(stats: &mut HashMap<IpAddr, IpStats>, ip: IpAddr, by
 
     entry.rx_packet_count += 1;
     entry.rx_byte_count += bytes;
-    
+
     let dst_port = tcp.get_destination();
     let _ack_num = tcp.get_acknowledgement();
     let window_size = tcp.get_window();
-    
+
     // 重複ACKの検出（簡易版）
     if (tcp.get_flags() & TcpFlags::ACK) != 0 && tcp.payload().is_empty() {
         // 同じACK番号が連続して来た場合は重複ACKとみなす
         entry.duplicate_acks += 1;
     }
-    
+
     // ウィンドウサイズ変更の検出
     if let Some(&last_window) = entry.last_window_size.get(&dst_port) {
         if window_size != last_window {
@@ -680,7 +826,7 @@ fn calculate_bps(stats: &mut HashMap<IpAddr, IpStats>) {
         if time_diff >= 1.0 {
             let tx_bytes_diff = stat.tx_byte_count - stat.tx_last_bytes;
             let rx_bytes_diff = stat.rx_byte_count - stat.rx_last_bytes;
-            
+
             // バイトをビットに変換してからビット/秒を計算
             stat.tx_current_bps = (tx_bytes_diff as f64 * 8.0) / time_diff;
             stat.rx_current_bps = (rx_bytes_diff as f64 * 8.0) / time_diff;
@@ -692,9 +838,10 @@ fn calculate_bps(stats: &mut HashMap<IpAddr, IpStats>) {
             // パケットロスの1秒間の値を計算
             stat.retransmissions_per_sec = stat.retransmissions - stat.last_retransmissions;
             stat.duplicate_acks_per_sec = stat.duplicate_acks - stat.last_duplicate_acks;
-            
+
             // ウィンドウサイズ変更の1秒間の値を計算
-            stat.window_size_changes_per_sec = stat.window_size_changes - stat.last_window_size_changes;
+            stat.window_size_changes_per_sec =
+                stat.window_size_changes - stat.last_window_size_changes;
 
             stat.tx_last_bytes = stat.tx_byte_count;
             stat.rx_last_bytes = stat.rx_byte_count;
@@ -710,7 +857,31 @@ fn print_stats(stats: &HashMap<IpAddr, IpStats>, target_ips: &HashSet<IpAddr>) {
     // Clear screen and move cursor to top
     print!("\x1B[2J\x1B[1;1H");
 
+    // インターフェース全体の合計を計算
+    let mut total_tx_bps = 0.0;
+    let mut total_rx_bps = 0.0;
+    let mut total_tx_bytes_per_sec = 0u64;
+    let mut total_rx_bytes_per_sec = 0u64;
+
+    for (ip, stat) in stats.iter() {
+        if target_ips.contains(ip) {
+            total_tx_bps += stat.tx_current_bps;
+            total_rx_bps += stat.rx_current_bps;
+            total_tx_bytes_per_sec += stat.tx_bytes_per_sec;
+            total_rx_bytes_per_sec += stat.rx_bytes_per_sec;
+        }
+    }
+
     println!("=== Subnet Network Traffic Monitor ===");
+    println!(
+        "Interface Total: TX: {} ({}/s) | RX: {} ({}/s) | Total: {}/s",
+        format_bps_short(total_tx_bps),
+        format_bytes_short(total_tx_bytes_per_sec),
+        format_bps_short(total_rx_bps),
+        format_bytes_short(total_rx_bytes_per_sec),
+        format_bps_short(total_tx_bps + total_rx_bps)
+    );
+    println!();
     println!(
         "{:<30} {:>10} {:>10} {:>10} {:>10} {:>6} {:>6} {:>6}",
         "IP Address", "TX/s", "RX/s", "↑ Up", "↓ Down", "PLoss/s", "DupAck/s", "WinChg/s"
@@ -732,7 +903,7 @@ fn print_stats(stats: &HashMap<IpAddr, IpStats>, target_ips: &HashSet<IpAddr>) {
         for (ip, stat) in sorted_stats.iter().take(20) {
             let is_subnet_ip = target_ips.contains(ip);
             let ip_prefix = if is_subnet_ip { "" } else { "*" };
-            
+
             println!(
                 "{}{:<29} {:>10} {:>10} {:>10} {:>10} {:>6} {:>6} {:>6}",
                 ip_prefix,
@@ -747,17 +918,22 @@ fn print_stats(stats: &HashMap<IpAddr, IpStats>, target_ips: &HashSet<IpAddr>) {
             );
         }
     }
-    
-    let subnet_ips_with_traffic = sorted_stats.iter()
+
+    let subnet_ips_with_traffic = sorted_stats
+        .iter()
         .filter(|(ip, _)| target_ips.contains(ip))
         .count();
     let external_ips_with_traffic = sorted_stats.len() - subnet_ips_with_traffic;
-    
+
     println!();
     println!("Legend: TX/s=TX Bytes per second, RX/s=RX Bytes per second, PLoss/s=Packet Loss per second");
     println!("        DupAck/s=Duplicate ACKs per second, WinChg/s=Window Size Changes per second");
-    println!("Subnet IPs: {} | External IPs: {} (*) | Total subnet: {}", 
-             subnet_ips_with_traffic, external_ips_with_traffic, target_ips.len());
+    println!(
+        "Subnet IPs: {} | External IPs: {} (*) | Total subnet: {}",
+        subnet_ips_with_traffic,
+        external_ips_with_traffic,
+        target_ips.len()
+    );
 }
 
 fn format_bps_short(bps: f64) -> String {
@@ -815,8 +991,11 @@ async fn start_prometheus_server(metrics: Arc<PrometheusMetrics>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], 59122));
     let server = Server::bind(&addr).serve(make_svc);
 
-    println!("Prometheus metrics server listening on http://{}/metrics", addr);
-    
+    println!(
+        "Prometheus metrics server listening on http://{}/metrics",
+        addr
+    );
+
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
     }
