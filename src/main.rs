@@ -9,10 +9,12 @@ use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::{TcpFlags, TcpPacket};
 use pnet::packet::Packet;
 use prometheus::{Counter, Encoder, Gauge, Registry, TextEncoder};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,6 +22,70 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 static SIGINT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StatusConfig {
+    lan: String,
+    wan0: String,
+    wan1: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StatusResponse {
+    config: StatusConfig,
+    mappings: HashMap<String, String>,
+}
+
+// IPアドレスのWAN割り当てを管理する構造体
+#[derive(Debug, Clone)]
+struct WanAssignments {
+    wan0_ips: HashSet<IpAddr>,
+    wan1_ips: HashSet<IpAddr>,
+}
+
+impl WanAssignments {
+    fn new() -> Self {
+        Self {
+            wan0_ips: HashSet::new(),
+            wan1_ips: HashSet::new(),
+        }
+    }
+
+    async fn fetch_from_api() -> Result<Self, Box<dyn std::error::Error>> {
+        let client = reqwest::Client::new();
+        let response = client
+            .get("http://localhost:32599/status")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+
+        let status: StatusResponse = response.json().await?;
+
+        let mut wan0_ips = HashSet::new();
+        let mut wan1_ips = HashSet::new();
+
+        for (ip_str, nic) in status.mappings {
+            if let Ok(ip) = IpAddr::from_str(&ip_str) {
+                match nic.as_str() {
+                    "wan0" => wan0_ips.insert(ip),
+                    "wan1" => wan1_ips.insert(ip),
+                    _ => false,
+                };
+            }
+        }
+
+        Ok(Self { wan0_ips, wan1_ips })
+    }
+
+    fn get_nic_for_ip(&self, ip: &IpAddr) -> String {
+        if self.wan1_ips.contains(ip) {
+            "wan1".to_string()
+        } else {
+            // デフォルトはwan0
+            "wan0".to_string()
+        }
+    }
+}
 
 struct PrometheusMetrics {
     registry: Registry,
@@ -42,6 +108,11 @@ struct PrometheusMetrics {
     ip_retransmissions_per_sec: prometheus::GaugeVec,
     ip_duplicate_acks_per_sec: prometheus::GaugeVec,
     ip_window_size_changes_per_sec: prometheus::GaugeVec,
+    // NIC別の合計メトリクス
+    nic_tx_bps_total: prometheus::GaugeVec,
+    nic_rx_bps_total: prometheus::GaugeVec,
+    nic_tx_bytes_per_sec_total: prometheus::GaugeVec,
+    nic_rx_bytes_per_sec_total: prometheus::GaugeVec,
 }
 
 impl PrometheusMetrics {
@@ -167,6 +238,40 @@ impl PrometheusMetrics {
         )
         .unwrap();
 
+        // NIC別の合計メトリクス
+        let nic_tx_bps_total = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "network_ip_tx_bps_total",
+                "Total transmitted bits per second by NIC",
+            ),
+            &["nic"],
+        )
+        .unwrap();
+        let nic_rx_bps_total = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "network_ip_rx_bps_total",
+                "Total received bits per second by NIC",
+            ),
+            &["nic"],
+        )
+        .unwrap();
+        let nic_tx_bytes_per_sec_total = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "network_ip_tx_bytes_per_sec_total",
+                "Total transmitted bytes per second by NIC",
+            ),
+            &["nic"],
+        )
+        .unwrap();
+        let nic_rx_bytes_per_sec_total = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "network_ip_rx_bytes_per_sec_total",
+                "Total received bytes per second by NIC",
+            ),
+            &["nic"],
+        )
+        .unwrap();
+
         // メトリクス登録
         registry.register(Box::new(tx_bytes_total.clone())).unwrap();
         registry.register(Box::new(rx_bytes_total.clone())).unwrap();
@@ -220,6 +325,18 @@ impl PrometheusMetrics {
         registry
             .register(Box::new(ip_window_size_changes_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(nic_tx_bps_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(nic_rx_bps_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(nic_tx_bytes_per_sec_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(nic_rx_bytes_per_sec_total.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -241,10 +358,19 @@ impl PrometheusMetrics {
             ip_retransmissions_per_sec,
             ip_duplicate_acks_per_sec,
             ip_window_size_changes_per_sec,
+            nic_tx_bps_total,
+            nic_rx_bps_total,
+            nic_tx_bytes_per_sec_total,
+            nic_rx_bytes_per_sec_total,
         }
     }
 
-    fn update_metrics(&self, stats: &HashMap<IpAddr, IpStats>, target_ips: &HashSet<IpAddr>) {
+    fn update_metrics(
+        &self,
+        stats: &HashMap<IpAddr, IpStats>,
+        target_ips: &HashSet<IpAddr>,
+        wan_assignments: &WanAssignments,
+    ) {
         let mut total_tx_bytes = 0u64;
         let mut total_rx_bytes = 0u64;
         let mut total_tx_bytes_per_sec = 0u64;
@@ -254,6 +380,9 @@ impl PrometheusMetrics {
         let mut total_retransmissions_per_sec = 0u64;
         let mut total_duplicate_acks_per_sec = 0u64;
         let mut total_window_size_changes_per_sec = 0u64;
+
+        // NIC別の合計値を計算するためのマップ
+        let mut nic_stats: HashMap<String, (f64, f64, u64, u64)> = HashMap::new(); // (tx_bps, rx_bps, tx_bytes_per_sec, rx_bytes_per_sec)
 
         for (ip, stat) in stats {
             let ip_str = ip.to_string();
@@ -298,6 +427,14 @@ impl PrometheusMetrics {
                 .with_label_values(&[&ip_str])
                 .set(stat.window_size_changes_per_sec as f64);
 
+            // NIC別の統計を集計
+            let nic = wan_assignments.get_nic_for_ip(ip);
+            let entry = nic_stats.entry(nic).or_insert((0.0, 0.0, 0, 0));
+            entry.0 += stat.tx_current_bps;
+            entry.1 += stat.rx_current_bps;
+            entry.2 += stat.tx_bytes_per_sec;
+            entry.3 += stat.rx_bytes_per_sec;
+
             // target_ipsに含まれる場合のみ全体統計に含める
             if target_ips.contains(ip) {
                 total_tx_bytes += stat.tx_byte_count;
@@ -335,6 +472,18 @@ impl PrometheusMetrics {
             .set(total_duplicate_acks_per_sec as f64);
         self.window_size_changes_per_sec
             .set(total_window_size_changes_per_sec as f64);
+
+        // NIC別の合計メトリクスを更新
+        for (nic, (tx_bps, rx_bps, tx_bytes_per_sec, rx_bytes_per_sec)) in nic_stats {
+            self.nic_tx_bps_total.with_label_values(&[&nic]).set(tx_bps);
+            self.nic_rx_bps_total.with_label_values(&[&nic]).set(rx_bps);
+            self.nic_tx_bytes_per_sec_total
+                .with_label_values(&[&nic])
+                .set(tx_bytes_per_sec as f64);
+            self.nic_rx_bytes_per_sec_total
+                .with_label_values(&[&nic])
+                .set(rx_bytes_per_sec as f64);
+        }
     }
 }
 
@@ -484,6 +633,42 @@ fn start_packet_capture(
     let ip_stats = Arc::new(Mutex::new(HashMap::new()));
     let running = Arc::new(AtomicBool::new(true));
 
+    // WAN割り当て情報を管理
+    let wan_assignments = Arc::new(Mutex::new(WanAssignments::new()));
+
+    // WAN割り当て情報を定期的に更新するスレッド
+    let wan_running = running.clone();
+    let wan_assignments_clone = wan_assignments.clone();
+    let rt_wan = Runtime::new().unwrap();
+    let wan_thread = thread::spawn(move || {
+        while wan_running.load(Ordering::SeqCst) {
+            rt_wan.block_on(async {
+                match WanAssignments::fetch_from_api().await {
+                    Ok(assignments) => {
+                        let mut wan_data = wan_assignments_clone.lock().unwrap();
+                        *wan_data = assignments;
+                        println!(
+                            "WAN assignments updated: wan0={} IPs, wan1={} IPs",
+                            wan_data.wan0_ips.len(),
+                            wan_data.wan1_ips.len()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to fetch WAN assignments: {}", e);
+                    }
+                }
+            });
+
+            // 30秒ごとに更新
+            for _ in 0..300 {
+                if !wan_running.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+
     // Ctrl+C ハンドラ
     ctrlc::set_handler(move || {
         let _count = SIGINT_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -497,6 +682,7 @@ fn start_packet_capture(
     let ip_stats_clone = Arc::clone(&ip_stats);
     let target_ips_clone = target_ips.clone();
     let prometheus_metrics_clone = prometheus_metrics.clone();
+    let wan_assignments_stats = wan_assignments.clone();
     let stats_thread = thread::spawn(move || {
         while stats_running.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(100)); // より短い間隔でチェック
@@ -506,7 +692,8 @@ fn start_packet_capture(
             {
                 let mut stats = ip_stats_clone.lock().unwrap();
                 calculate_bps(&mut stats);
-                prometheus_metrics_clone.update_metrics(&stats, &target_ips_clone);
+                let wan_data = wan_assignments_stats.lock().unwrap();
+                prometheus_metrics_clone.update_metrics(&stats, &target_ips_clone, &wan_data);
                 print_stats(&stats, &target_ips_clone);
             }
             // 1秒待つが、100msごとに中断チェック
@@ -624,12 +811,14 @@ fn start_packet_capture(
 
     // 統計表示スレッドの終了を待つ
     let _ = stats_thread.join();
+    let _ = wan_thread.join();
 
     println!("\nFinal statistics:");
     {
         let mut final_stats = ip_stats.lock().unwrap();
         calculate_bps(&mut final_stats);
-        prometheus_metrics.update_metrics(&final_stats, &target_ips);
+        let wan_data = wan_assignments.lock().unwrap();
+        prometheus_metrics.update_metrics(&final_stats, &target_ips, &wan_data);
         print_stats(&final_stats, &target_ips);
     }
 }
@@ -857,31 +1046,7 @@ fn print_stats(stats: &HashMap<IpAddr, IpStats>, target_ips: &HashSet<IpAddr>) {
     // Clear screen and move cursor to top
     print!("\x1B[2J\x1B[1;1H");
 
-    // インターフェース全体の合計を計算
-    let mut total_tx_bps = 0.0;
-    let mut total_rx_bps = 0.0;
-    let mut total_tx_bytes_per_sec = 0u64;
-    let mut total_rx_bytes_per_sec = 0u64;
-
-    for (ip, stat) in stats.iter() {
-        if target_ips.contains(ip) {
-            total_tx_bps += stat.tx_current_bps;
-            total_rx_bps += stat.rx_current_bps;
-            total_tx_bytes_per_sec += stat.tx_bytes_per_sec;
-            total_rx_bytes_per_sec += stat.rx_bytes_per_sec;
-        }
-    }
-
     println!("=== Subnet Network Traffic Monitor ===");
-    println!(
-        "Interface Total: TX: {} ({}/s) | RX: {} ({}/s) | Total: {}/s",
-        format_bps_short(total_tx_bps),
-        format_bytes_short(total_tx_bytes_per_sec),
-        format_bps_short(total_rx_bps),
-        format_bytes_short(total_rx_bytes_per_sec),
-        format_bps_short(total_tx_bps + total_rx_bps)
-    );
-    println!();
     println!(
         "{:<30} {:>10} {:>10} {:>10} {:>10} {:>6} {:>6} {:>6}",
         "IP Address", "TX/s", "RX/s", "↑ Up", "↓ Down", "PLoss/s", "DupAck/s", "WinChg/s"
