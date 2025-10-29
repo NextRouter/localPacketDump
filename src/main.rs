@@ -23,6 +23,10 @@ use tokio::runtime::Runtime;
 
 static SIGINT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+mod version {
+    pub const VERSION: &str = "1.0.0";
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StatusConfig {
     lan: String,
@@ -620,6 +624,7 @@ fn start_packet_capture(
 
     println!("Capturing on interface: {}", device.name);
     println!("Monitoring {} IP addresses in the subnet", target_ips.len());
+    println!("version {}", version::VERSION);
 
     // キャプチャを開始
     let mut cap = Capture::from_device(device)
@@ -668,14 +673,6 @@ fn start_packet_capture(
             }
         }
     });
-
-    // Ctrl+C ハンドラ
-    ctrlc::set_handler(move || {
-        let _count = SIGINT_COUNT.fetch_add(1, Ordering::SeqCst);
-        println!("\nForce quitting...");
-        process::exit(0);
-    })
-    .expect("Error setting Ctrl-C handler");
 
     // 統計表示用スレッド
     let stats_running = running.clone();
@@ -1089,10 +1086,6 @@ fn print_stats(stats: &HashMap<IpAddr, IpStats>, target_ips: &HashSet<IpAddr>) {
         .filter(|(ip, _)| target_ips.contains(ip))
         .count();
     let external_ips_with_traffic = sorted_stats.len() - subnet_ips_with_traffic;
-
-    println!();
-    println!("Legend: TX/s=TX Bytes per second, RX/s=RX Bytes per second, PLoss/s=Packet Loss per second");
-    println!("        DupAck/s=Duplicate ACKs per second, WinChg/s=Window Size Changes per second");
     println!(
         "Subnet IPs: {} | External IPs: {} (*) | Total subnet: {}",
         subnet_ips_with_traffic,
