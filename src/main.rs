@@ -27,6 +27,10 @@ mod version {
     pub const VERSION: &str = "1.0.0";
 }
 
+// 固定値設定: Noneの場合は自動検出、Some((ip, prefix))の場合は固定値を使用
+// 例: Some((Ipv4Addr::new(192, 168, 1, 1), 24))
+const FIXED_INTERFACE_CONFIG: Option<(Ipv4Addr, u8)> = Some((Ipv4Addr::new(10, 40, 0, 1), 20));
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StatusConfig {
     lan: String,
@@ -560,51 +564,66 @@ fn main() {
 
     let interface_name = &args[1];
 
-    match get_interface_info(interface_name) {
-        Some((ip, prefix)) => {
-            println!("Interface: {}", interface_name);
-            println!("IP Address: {}", ip);
-            println!("Subnet Mask: /{}", prefix);
-
-            let ip_set = ipv4_list(ip, prefix);
-            println!(
-                "Available IP addresses in subnet: {} addresses",
-                ip_set.len()
-            );
-
-            // 最初の10個のIPアドレスを表示
-            let mut count = 0;
-            for ip_addr in &ip_set {
-                if count < 10 {
-                    println!("  {}", ip_addr);
-                    count += 1;
-                } else {
-                    println!("  ... and {} more", ip_set.len() - 10);
-                    break;
-                }
+    // 固定値が設定されている場合はそれを使用、なければ自動検出
+    let (ip, prefix) = if let Some((fixed_ip, fixed_prefix)) = FIXED_INTERFACE_CONFIG {
+        // コード内の固定値を使用
+        println!("Using fixed configuration from code:");
+        println!("  IP={}", fixed_ip);
+        println!("  PREFIX={}", fixed_prefix);
+        (fixed_ip, fixed_prefix)
+    } else {
+        // 自動検出
+        match get_interface_info(interface_name) {
+            Some((ip, prefix)) => {
+                println!("Using auto-detected configuration:");
+                (ip, prefix)
             }
-
-            // Prometheusメトリクスを初期化
-            let prometheus_metrics = Arc::new(PrometheusMetrics::new());
-
-            // Prometheus HTTPサーバーを起動
-            let metrics_clone = prometheus_metrics.clone();
-            let rt = Runtime::new().unwrap();
-            rt.spawn(async move {
-                start_prometheus_server(metrics_clone).await;
-            });
-
-            // パケットキャプチャ部分に進む
-            start_packet_capture(interface_name, ip_set, prometheus_metrics);
+            None => {
+                eprintln!(
+                    "Interface '{}' not found or has no IPv4 address",
+                    interface_name
+                );
+                eprintln!("\nTo use fixed values, edit FIXED_INTERFACE_CONFIG in the code:");
+                eprintln!("  const FIXED_INTERFACE_CONFIG: Option<(Ipv4Addr, u8)> = Some((Ipv4Addr::new(192, 168, 1, 1), 24));");
+                process::exit(1);
+            }
         }
-        None => {
-            eprintln!(
-                "Interface '{}' not found or has no IPv4 address",
-                interface_name
-            );
-            process::exit(1);
+    };
+
+    println!("Interface: {}", interface_name);
+    println!("IP Address: {}", ip);
+    println!("Subnet Mask: /{}", prefix);
+
+    let ip_set = ipv4_list(ip, prefix);
+    println!(
+        "Available IP addresses in subnet: {} addresses",
+        ip_set.len()
+    );
+
+    // 最初の10個のIPアドレスを表示
+    let mut count = 0;
+    for ip_addr in &ip_set {
+        if count < 10 {
+            println!("  {}", ip_addr);
+            count += 1;
+        } else {
+            println!("  ... and {} more", ip_set.len() - 10);
+            break;
         }
     }
+
+    // Prometheusメトリクスを初期化
+    let prometheus_metrics = Arc::new(PrometheusMetrics::new());
+
+    // Prometheus HTTPサーバーを起動
+    let metrics_clone = prometheus_metrics.clone();
+    let rt = Runtime::new().unwrap();
+    rt.spawn(async move {
+        start_prometheus_server(metrics_clone).await;
+    });
+
+    // パケットキャプチャ部分に進む
+    start_packet_capture(interface_name, ip_set, prometheus_metrics);
 }
 
 fn start_packet_capture(
