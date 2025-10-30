@@ -24,7 +24,7 @@ use tokio::runtime::Runtime;
 static SIGINT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 mod version {
-    pub const VERSION: &str = "1.0.0";
+    pub const VERSION: &str = "1.0.1";
 }
 
 // 固定値設定: Noneの場合は自動検出、Some((ip, prefix))の場合は固定値を使用
