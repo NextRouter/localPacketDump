@@ -246,7 +246,7 @@ impl PrometheusMetrics {
         )
         .unwrap();
 
-        // NIC別の合計メトリクス
+        // NIC別の合計メトリクス（要件に合わせて名前を修正）
         let nic_tx_bps_total = prometheus::GaugeVec::new(
             prometheus::Opts::new(
                 "network_ip_tx_bps_total",
@@ -392,7 +392,13 @@ impl PrometheusMetrics {
         // NIC別の合計値を計算するためのマップ
         let mut nic_stats: HashMap<String, (f64, f64, u64, u64)> = HashMap::new(); // (tx_bps, rx_bps, tx_bytes_per_sec, rx_bytes_per_sec)
 
+        // target_ipsに含まれるIPアドレスのみを処理
         for (ip, stat) in stats {
+            // target_ipsに含まれないIPは無視
+            if !target_ips.contains(ip) {
+                continue;
+            }
+
             let ip_str = ip.to_string();
 
             // 累積値は一度だけ設定（reset使わない）
@@ -417,6 +423,8 @@ impl PrometheusMetrics {
             self.ip_rx_bytes_per_sec
                 .with_label_values(&[&ip_str])
                 .set(stat.rx_bytes_per_sec as f64);
+
+            // bps値を設定（これが重要なメトリクス）
             self.ip_tx_bps
                 .with_label_values(&[&ip_str])
                 .set(stat.tx_current_bps);
@@ -435,7 +443,7 @@ impl PrometheusMetrics {
                 .with_label_values(&[&ip_str])
                 .set(stat.window_size_changes_per_sec as f64);
 
-            // NIC別の統計を集計
+            // NIC別の統計を集計（target_ipsに含まれるIPのみ）
             let nic = wan_assignments.get_nic_for_ip(ip);
             let entry = nic_stats.entry(nic).or_insert((0.0, 0.0, 0, 0));
             entry.0 += stat.tx_current_bps;
@@ -443,18 +451,16 @@ impl PrometheusMetrics {
             entry.2 += stat.tx_bytes_per_sec;
             entry.3 += stat.rx_bytes_per_sec;
 
-            // target_ipsに含まれる場合のみ全体統計に含める
-            if target_ips.contains(ip) {
-                total_tx_bytes += stat.tx_byte_count;
-                total_rx_bytes += stat.rx_byte_count;
-                total_tx_bytes_per_sec += stat.tx_bytes_per_sec;
-                total_rx_bytes_per_sec += stat.rx_bytes_per_sec;
-                total_tx_bps += stat.tx_current_bps;
-                total_rx_bps += stat.rx_current_bps;
-                total_retransmissions_per_sec += stat.retransmissions_per_sec;
-                total_duplicate_acks_per_sec += stat.duplicate_acks_per_sec;
-                total_window_size_changes_per_sec += stat.window_size_changes_per_sec;
-            }
+            // 全体統計に含める
+            total_tx_bytes += stat.tx_byte_count;
+            total_rx_bytes += stat.rx_byte_count;
+            total_tx_bytes_per_sec += stat.tx_bytes_per_sec;
+            total_rx_bytes_per_sec += stat.rx_bytes_per_sec;
+            total_tx_bps += stat.tx_current_bps;
+            total_rx_bps += stat.rx_current_bps;
+            total_retransmissions_per_sec += stat.retransmissions_per_sec;
+            total_duplicate_acks_per_sec += stat.duplicate_acks_per_sec;
+            total_window_size_changes_per_sec += stat.window_size_changes_per_sec;
         }
 
         // 全体のメトリクスを更新（累積値は適切に処理）
@@ -660,12 +666,40 @@ fn start_packet_capture(
     // WAN割り当て情報を管理
     let wan_assignments = Arc::new(Mutex::new(WanAssignments::new()));
 
+    // 起動時にWAN割り当て情報を取得
+    let rt_init = Runtime::new().unwrap();
+    rt_init.block_on(async {
+        match WanAssignments::fetch_from_api().await {
+            Ok(assignments) => {
+                let mut wan_data = wan_assignments.lock().unwrap();
+                *wan_data = assignments;
+                println!(
+                    "Initial WAN assignments loaded: wan0={} IPs, wan1={} IPs",
+                    wan_data.wan0_ips.len(),
+                    wan_data.wan1_ips.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("Failed to fetch initial WAN assignments: {}", e);
+                eprintln!("Will retry in background thread...");
+            }
+        }
+    });
+
     // WAN割り当て情報を定期的に更新するスレッド
     let wan_running = running.clone();
     let wan_assignments_clone = wan_assignments.clone();
     let rt_wan = Runtime::new().unwrap();
     let wan_thread = thread::spawn(move || {
         while wan_running.load(Ordering::SeqCst) {
+            // 30秒待機してから更新
+            for _ in 0..300 {
+                if !wan_running.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+
             rt_wan.block_on(async {
                 match WanAssignments::fetch_from_api().await {
                     Ok(assignments) => {
@@ -682,14 +716,6 @@ fn start_packet_capture(
                     }
                 }
             });
-
-            // 30秒ごとに更新
-            for _ in 0..300 {
-                if !wan_running.load(Ordering::SeqCst) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
         }
     });
 
@@ -742,6 +768,9 @@ fn start_packet_capture(
                                 if target_ips.contains(&src_ip) || target_ips.contains(&dst_ip) {
                                     let mut stats = ip_stats.lock().unwrap();
 
+                                    // パケット全体のサイズを使用（ヘッダー + ペイロード）
+                                    let packet_size = packet.data.len() as u64;
+
                                     // TCPパケットの場合、追加情報を解析
                                     if ipv4.get_next_level_protocol()
                                         == pnet::packet::ip::IpNextHeaderProtocols::Tcp
@@ -752,7 +781,7 @@ fn start_packet_capture(
                                                 update_tx_stats_with_tcp(
                                                     &mut stats,
                                                     src_ip,
-                                                    packet.header.len as u64,
+                                                    packet_size,
                                                     &tcp,
                                                 );
                                             }
@@ -762,7 +791,7 @@ fn start_packet_capture(
                                                 update_rx_stats_with_tcp(
                                                     &mut stats,
                                                     dst_ip,
-                                                    packet.header.len as u64,
+                                                    packet_size,
                                                     &tcp,
                                                 );
                                             }
@@ -770,19 +799,11 @@ fn start_packet_capture(
                                     } else {
                                         // 非TCPパケット
                                         if target_ips.contains(&src_ip) {
-                                            update_tx_stats(
-                                                &mut stats,
-                                                src_ip,
-                                                packet.header.len as u64,
-                                            );
+                                            update_tx_stats(&mut stats, src_ip, packet_size);
                                         }
 
                                         if target_ips.contains(&dst_ip) {
-                                            update_rx_stats(
-                                                &mut stats,
-                                                dst_ip,
-                                                packet.header.len as u64,
-                                            );
+                                            update_rx_stats(&mut stats, dst_ip, packet_size);
                                         }
                                     }
                                 }
@@ -791,12 +812,20 @@ fn start_packet_capture(
                         EtherTypes::Ipv6 => {
                             if let Some(ipv6) = Ipv6Packet::new(ethernet.payload()) {
                                 let src_ip = IpAddr::V6(ipv6.get_source());
-                                let _dst_ip = IpAddr::V6(ipv6.get_destination());
+                                let dst_ip = IpAddr::V6(ipv6.get_destination());
 
-                                // IPv6の場合、ターゲットセットには含まれていないが、記録はする
-                                // 必要に応じてIPv6のフィルタリングも追加可能
-                                let mut stats = ip_stats.lock().unwrap();
-                                update_tx_stats(&mut stats, src_ip, packet.header.len as u64);
+                                // IPv6の場合も同様に処理（target_ipsには含まれないため記録されるが集計されない）
+                                if target_ips.contains(&src_ip) || target_ips.contains(&dst_ip) {
+                                    let mut stats = ip_stats.lock().unwrap();
+                                    let packet_size = packet.data.len() as u64;
+
+                                    if target_ips.contains(&src_ip) {
+                                        update_tx_stats(&mut stats, src_ip, packet_size);
+                                    }
+                                    if target_ips.contains(&dst_ip) {
+                                        update_rx_stats(&mut stats, dst_ip, packet_size);
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -1028,25 +1057,32 @@ fn calculate_bps(stats: &mut HashMap<IpAddr, IpStats>) {
 
     for (_, stat) in stats.iter_mut() {
         let time_diff = now.duration_since(stat.last_time).as_secs_f64();
-        if time_diff >= 1.0 {
-            let tx_bytes_diff = stat.tx_byte_count - stat.tx_last_bytes;
-            let rx_bytes_diff = stat.rx_byte_count - stat.rx_last_bytes;
+
+        // 最低0.1秒経過していれば計算（より頻繁に更新）
+        if time_diff >= 0.1 {
+            let tx_bytes_diff = stat.tx_byte_count.saturating_sub(stat.tx_last_bytes);
+            let rx_bytes_diff = stat.rx_byte_count.saturating_sub(stat.rx_last_bytes);
 
             // バイトをビットに変換してからビット/秒を計算
             stat.tx_current_bps = (tx_bytes_diff as f64 * 8.0) / time_diff;
             stat.rx_current_bps = (rx_bytes_diff as f64 * 8.0) / time_diff;
 
-            // 1秒間のバイト数を計算
-            stat.tx_bytes_per_sec = tx_bytes_diff;
-            stat.rx_bytes_per_sec = rx_bytes_diff;
+            // 1秒あたりのバイト数に正規化
+            stat.tx_bytes_per_sec = (tx_bytes_diff as f64 / time_diff) as u64;
+            stat.rx_bytes_per_sec = (rx_bytes_diff as f64 / time_diff) as u64;
 
-            // パケットロスの1秒間の値を計算
-            stat.retransmissions_per_sec = stat.retransmissions - stat.last_retransmissions;
-            stat.duplicate_acks_per_sec = stat.duplicate_acks - stat.last_duplicate_acks;
+            // パケットロスの1秒あたりの値を計算
+            let retrans_diff = stat
+                .retransmissions
+                .saturating_sub(stat.last_retransmissions);
+            let dup_ack_diff = stat.duplicate_acks.saturating_sub(stat.last_duplicate_acks);
+            let win_chg_diff = stat
+                .window_size_changes
+                .saturating_sub(stat.last_window_size_changes);
 
-            // ウィンドウサイズ変更の1秒間の値を計算
-            stat.window_size_changes_per_sec =
-                stat.window_size_changes - stat.last_window_size_changes;
+            stat.retransmissions_per_sec = (retrans_diff as f64 / time_diff) as u64;
+            stat.duplicate_acks_per_sec = (dup_ack_diff as f64 / time_diff) as u64;
+            stat.window_size_changes_per_sec = (win_chg_diff as f64 / time_diff) as u64;
 
             stat.tx_last_bytes = stat.tx_byte_count;
             stat.rx_last_bytes = stat.rx_byte_count;
